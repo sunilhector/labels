@@ -1,0 +1,1733 @@
+#!/usr/bin/env python3
+"""
+GCP Resource Label Remover
+
+Fetches labeled resources across GCP services, removes their labels,
+and produces an audit CSV report.
+
+Services covered:
+  compute         - Instances, Disks, Snapshots, Images
+  networking      - Forwarding Rules (regional + global), VPN Gateways,
+                    External VPN Gateways
+  gcs             - Cloud Storage Buckets
+  bigquery        - Datasets, Tables
+  gke             - GKE Clusters
+  pubsub          - Topics, Subscriptions
+  run             - Cloud Run Services
+  functions       - Cloud Functions (gen2)
+  sql             - Cloud SQL Instances
+  kms             - Cloud KMS Crypto Keys
+  secretmanager   - Secret Manager Secrets
+  monitoring      - Cloud Monitoring Alert Policies
+  dns             - Cloud DNS Managed Zones
+  artifactregistry- Artifact Registry Repositories
+  vertexai        - Vertex AI Datasets, Models, Endpoints
+  vertexaisearch  - Vertex AI Search / Discovery Engine Data Stores
+  dataplex        - Dataplex Lakes, Zones, Assets
+  notebooks       - Vertex AI Workbench Instances
+  workstations    - Cloud Workstations Clusters, Configs, Workstations
+  healthcare      - Cloud Healthcare Datasets, DICOM / FHIR / HL7v2 Stores
+  scheduler       - Cloud Scheduler Jobs
+  datacatalog     - Data Catalog Entry Groups
+
+Notes on services without label support in the GCP API:
+  - Cloud Logging   : LogBucket / LogSink have no labels field
+  - App Engine      : Service / Version resources have no labels API
+  - Cloud Tasks     : Queue (v2) has no labels field
+  - VM Manager      : Patch deployments have no labels field
+  - Velostrata/C2D  : Resources are standard Compute VMs/images (use 'compute')
+
+Usage:
+    python gcp_label_remover.py --project my-project --dry-run
+    python gcp_label_remover.py --project my-project --execute
+    python gcp_label_remover.py --project my-project --execute --services kms,secretmanager,bigquery
+    python gcp_label_remover.py --project my-project --dry-run --label-keys costcentre,apmid
+    python gcp_label_remover.py --project my-project --execute --label-keys costcentre,apmid
+    python gcp_label_remover.py --project my-project --dry-run \
+        --label-keys costcentre,apmid --fuzzy-threshold 0.82
+
+Label key filtering (--label-keys):
+    When --label-keys is provided, only labels whose KEY matches one of the
+    supplied names are removed. All other labels on the resource are preserved.
+    Resources that do not carry any of the target keys are skipped entirely.
+    When omitted, ALL labels are removed (original behaviour).
+
+Fuzzy / variant key matching (--fuzzy-threshold):
+    Real-world label keys are often misspelled or formatted differently across
+    projects and teams. Three matching layers are applied in order:
+
+      1. Exact   (case-insensitive)  costcentre  == Costcentre
+      2. Normalized (strip - _ space) cost-centre == cost_centre == costcentre
+      3. Fuzzy   (edit-distance)     costcanter  ~~ costcentre   (if threshold set)
+
+    --fuzzy-threshold sets the minimum similarity ratio (0.0–1.0) for layer 3.
+    A value of 0.82 catches most single-character typos while avoiding false
+    positives. Default is 0.0 (fuzzy matching disabled).
+
+    Every fuzzy / normalised match is logged as a WARNING and recorded in the
+    audit CSV under the key_matches column so you can review what was matched.
+"""
+
+import csv
+import difflib
+import json
+import logging
+import re
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Callable, Optional
+
+import click
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Common GCP regions — used when an API does not support location wildcards
+# ---------------------------------------------------------------------------
+# Fallback region lists used ONLY when --regions is not supplied and the
+# locations API call fails.  Kept intentionally broad so nothing is missed
+# when users run without a region filter.
+# ---------------------------------------------------------------------------
+COMMON_REGIONS = [
+    "us-central1", "us-east1", "us-east4", "us-east5", "us-south1",
+    "us-west1", "us-west2", "us-west3", "us-west4",
+    "northamerica-northeast1", "northamerica-northeast2",
+    "southamerica-east1", "southamerica-west1",
+    "europe-central2", "europe-north1", "europe-southwest1",
+    "europe-west1", "europe-west2", "europe-west3", "europe-west4",
+    "europe-west6", "europe-west8", "europe-west9",
+    "asia-east1", "asia-east2",
+    "asia-northeast1", "asia-northeast2", "asia-northeast3",
+    "asia-south1", "asia-south2",
+    "asia-southeast1", "asia-southeast2",
+    "australia-southeast1", "australia-southeast2",
+    "me-central1", "me-west1",
+]
+
+VERTEX_AI_REGIONS = [
+    "us-central1", "us-east1", "us-east4", "us-west1", "us-west2", "us-west4",
+    "europe-west1", "europe-west2", "europe-west4",
+    "asia-east1", "asia-northeast1", "asia-northeast3",
+    "asia-south1", "asia-southeast1",
+    "australia-southeast1",
+]
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ResourceRecord:
+    service: str
+    resource_type: str
+    name: str
+    resource_id: str        # full GCP resource path used in API calls
+    location: str
+    labels_removed: dict    # label keys that will be / were deleted
+    labels_kept: dict       # label keys preserved on the resource
+    # Maps actual resource key → canonical target key it matched via
+    # normalization or fuzzy matching.  Empty for exact matches.
+    # e.g. {"costcanter": "costcentre", "cost_centre": "costcentre"}
+    key_matches: dict = field(default_factory=dict)
+    status: str = "pending"   # pending | removed | dry-run | skipped | failed
+    error: str = ""
+    timestamp: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+    @property
+    def label_count(self) -> int:
+        return len(self.labels_removed)
+
+    def to_csv_row(self) -> dict:
+        return {
+            "service": self.service,
+            "resource_type": self.resource_type,
+            "name": self.name,
+            "resource_id": self.resource_id,
+            "location": self.location,
+            "labels_removed_count": self.label_count,
+            "labels_removed": json.dumps(self.labels_removed),
+            "labels_kept": json.dumps(self.labels_kept),
+            "key_matches": json.dumps(self.key_matches) if self.key_matches else "",
+            "status": self.status,
+            "error": self.error,
+            "timestamp": self.timestamp,
+        }
+
+
+CSV_FIELDS = [
+    "service", "resource_type", "name", "resource_id", "location",
+    "labels_removed_count", "labels_removed", "labels_kept", "key_matches",
+    "status", "error", "timestamp",
+]
+
+
+# ---------------------------------------------------------------------------
+# Main class
+# ---------------------------------------------------------------------------
+
+class GCPLabelRemover:
+
+    def __init__(self, project_id: str, dry_run: bool, services: list,
+                 label_keys: Optional[set] = None,
+                 fuzzy_threshold: float = 0.0,
+                 regions: Optional[set] = None):
+        self.project_id = project_id
+        self.dry_run = dry_run
+        self.services = services
+        # Normalise to lowercase set; None means "remove all labels"
+        self.label_keys: Optional[set] = (
+            {k.strip().lower() for k in label_keys if k.strip()}
+            if label_keys else None
+        )
+        # 0.0 = disabled; 0.82 catches most single-char typos
+        self.fuzzy_threshold: float = fuzzy_threshold
+        # None = scan all regions; set = scan only these regions.
+        # A zone like "us-central1-a" is matched to its parent region
+        # "us-central1" before the filter is applied.
+        self.regions: Optional[set] = (
+            {r.strip().lower() for r in regions if r.strip()}
+            if regions else None
+        )
+        self.records: list = []
+        self._session = None   # lazy AuthorizedSession
+
+    # -----------------------------------------------------------------------
+    # Orchestration
+    # -----------------------------------------------------------------------
+
+    def run(self) -> list:
+        logger.info(
+            "Starting scan | project=%s  dry_run=%s  services=%s",
+            self.project_id, self.dry_run, self.services,
+        )
+        self._fetch_all()
+        logger.info("Found %d labeled resource(s).", len(self.records))
+        if self.records:
+            self._remove_all_labels()
+        return self.records
+
+    def _fetch_all(self):
+        fetchers = {
+            "compute":          self._fetch_compute,
+            "networking":       self._fetch_networking,
+            "gcs":              self._fetch_gcs,
+            "bigquery":         self._fetch_bigquery,
+            "gke":              self._fetch_gke,
+            "pubsub":           self._fetch_pubsub,
+            "run":              self._fetch_cloud_run,
+            "functions":        self._fetch_functions,
+            "sql":              self._fetch_cloud_sql,
+            "kms":              self._fetch_kms,
+            "secretmanager":    self._fetch_secretmanager,
+            "monitoring":       self._fetch_monitoring,
+            "dns":              self._fetch_dns,
+            "artifactregistry": self._fetch_artifactregistry,
+            "vertexai":         self._fetch_vertexai,
+            "vertexaisearch":   self._fetch_vertexaisearch,
+            "dataplex":         self._fetch_dataplex,
+            "notebooks":        self._fetch_notebooks,
+            "workstations":     self._fetch_workstations,
+            "healthcare":       self._fetch_healthcare,
+            "scheduler":        self._fetch_scheduler,
+            "datacatalog":      self._fetch_datacatalog,
+        }
+        for svc in self.services:
+            if svc not in fetchers:
+                logger.warning("Unknown service '%s' — skipping.", svc)
+                continue
+            logger.info("Scanning: %s", svc)
+            try:
+                self._backoff_retry(fetchers[svc], label=svc)
+            except Exception as exc:
+                logger.error("Error scanning %s: %s", svc, exc)
+
+    def _remove_all_labels(self):
+        dispatch = {
+            ("compute",          "instance"):            self._remove_compute_instance_labels,
+            ("compute",          "disk"):                self._remove_compute_disk_labels,
+            ("compute",          "snapshot"):            self._remove_compute_snapshot_labels,
+            ("compute",          "image"):               self._remove_compute_image_labels,
+            ("networking",       "forwardingrule"):      self._remove_forwarding_rule_labels,
+            ("networking",       "globalforwardingrule"):self._remove_global_forwarding_rule_labels,
+            ("networking",       "vpngateway"):          self._remove_vpn_gateway_labels,
+            ("networking",       "externalvpngateway"):  self._remove_external_vpn_gateway_labels,
+            ("gcs",              "bucket"):              self._remove_gcs_labels,
+            ("bigquery",         "dataset"):             self._remove_bigquery_dataset_labels,
+            ("bigquery",         "table"):               self._remove_bigquery_table_labels,
+            ("gke",              "cluster"):             self._remove_gke_cluster_labels,
+            ("pubsub",           "topic"):               self._remove_pubsub_topic_labels,
+            ("pubsub",           "subscription"):        self._remove_pubsub_subscription_labels,
+            ("run",              "service"):             self._remove_cloud_run_labels,
+            ("functions",        "function"):            self._remove_function_labels,
+            ("sql",              "instance"):            self._remove_sql_instance_labels,
+            ("kms",              "cryptokey"):           self._remove_kms_cryptokey_labels,
+            ("secretmanager",    "secret"):              self._remove_secret_labels,
+            ("monitoring",       "alertpolicy"):         self._remove_alert_policy_labels,
+            ("dns",              "zone"):                self._remove_dns_zone_labels,
+            ("artifactregistry", "repository"):          self._remove_artifact_repo_labels,
+            ("vertexai",         "dataset"):             self._remove_vertexai_dataset_labels,
+            ("vertexai",         "model"):               self._remove_vertexai_model_labels,
+            ("vertexai",         "endpoint"):            self._remove_vertexai_endpoint_labels,
+            ("vertexaisearch",   "datastore"):           self._remove_vertexaisearch_datastore_labels,
+            ("dataplex",         "lake"):                self._remove_dataplex_lake_labels,
+            ("dataplex",         "zone"):                self._remove_dataplex_zone_labels,
+            ("dataplex",         "asset"):               self._remove_dataplex_asset_labels,
+            ("notebooks",        "instance"):            self._remove_notebook_instance_labels,
+            ("workstations",     "cluster"):             self._remove_workstation_cluster_labels,
+            ("workstations",     "config"):              self._remove_workstation_config_labels,
+            ("workstations",     "workstation"):         self._remove_workstation_labels,
+            ("healthcare",       "dataset"):             self._remove_healthcare_dataset_labels,
+            ("healthcare",       "dicomstore"):          self._remove_healthcare_dicom_store_labels,
+            ("healthcare",       "fhirstore"):           self._remove_healthcare_fhir_store_labels,
+            ("healthcare",       "hl7v2store"):          self._remove_healthcare_hl7v2_store_labels,
+            ("scheduler",        "job"):                 self._remove_scheduler_job_labels,
+            ("datacatalog",      "entrygroup"):          self._remove_datacatalog_entrygroup_labels,
+        }
+
+        for rec in self.records:
+            if self.dry_run:
+                rec.status = "dry-run"
+                logger.info(
+                    "[DRY-RUN] Would remove %d label(s) %s from %s/%s: %s"
+                    " (keeping: %s)",
+                    rec.label_count, list(rec.labels_removed.keys()),
+                    rec.service, rec.resource_type, rec.name,
+                    list(rec.labels_kept.keys()) or "nothing",
+                )
+                continue
+            remover = dispatch.get((rec.service, rec.resource_type))
+            if remover is None:
+                rec.status = "skipped"
+                continue
+            try:
+                remover(rec)
+                rec.status = "removed"
+                logger.info(
+                    "Removed %d label(s) from %s/%s: %s",
+                    rec.label_count, rec.service, rec.resource_type, rec.name,
+                )
+            except Exception as exc:
+                rec.status = "failed"
+                rec.error = str(exc)
+                logger.error(
+                    "FAILED %s/%s %s: %s",
+                    rec.service, rec.resource_type, rec.name, exc,
+                )
+
+    # -----------------------------------------------------------------------
+    # Shared helpers
+    # -----------------------------------------------------------------------
+
+    def _record(self, service, rtype, name, resource_id, location, all_labels):
+        # Region filter — applied before anything else.
+        # Covers ALL services: wildcard fetches return all regions but only
+        # resources whose location matches the filter are recorded.
+        if not self._in_regions(location):
+            return
+
+        all_labels = dict(all_labels)
+
+        if self.label_keys is not None:
+            labels_removed: dict = {}
+            key_matches: dict = {}      # actual_key → canonical_target
+
+            for k, v in all_labels.items():
+                matched = self._matched_target(k)
+                if matched is not None:
+                    labels_removed[k] = v
+                    # Record non-exact matches so they appear in the CSV
+                    if matched != k.lower():
+                        key_matches[k] = matched
+                        logger.warning(
+                            "Key variant matched — resource %s/%s '%s': "
+                            "label key '%s' matched target '%s'",
+                            rtype, name, resource_id, k, matched,
+                        )
+
+            labels_kept = {k: v for k, v in all_labels.items()
+                           if k not in labels_removed}
+        else:
+            labels_removed = all_labels
+            labels_kept = {}
+            key_matches = {}
+
+        if not labels_removed:
+            return  # resource carries none of the target keys — skip it
+
+        self.records.append(ResourceRecord(
+            service=service, resource_type=rtype,
+            name=name, resource_id=resource_id,
+            location=location,
+            labels_removed=labels_removed,
+            labels_kept=labels_kept,
+            key_matches=key_matches,
+        ))
+
+    @staticmethod
+    def _region_of(location: str) -> str:
+        """
+        Normalize a zone or region string to its parent region.
+
+        "us-central1-a" → "us-central1"   (zone → region)
+        "us-central1"   → "us-central1"   (already a region)
+        "global"        → "global"
+        """
+        loc = location.split("/")[-1]          # strip "zones/" / "regions/" prefix
+        parts = loc.rsplit("-", 1)
+        # A zone always ends with a single letter (a, b, c, f …)
+        if len(parts) == 2 and len(parts[1]) == 1 and parts[1].isalpha():
+            return parts[0]
+        return loc
+
+    def _in_regions(self, location: str) -> bool:
+        """Return True if this resource location is within the region filter."""
+        if self.regions is None:
+            return True
+        if location in ("global", "unknown"):
+            return True   # global/unknown resources are never region-filtered
+        return self._region_of(location) in self.regions
+
+    def _authed_get(self, url: str) -> dict:
+        import google.auth
+        import google.auth.transport.requests
+        import requests as http_requests
+
+        if self._session is None:
+            creds, _ = google.auth.default()
+            self._session = google.auth.transport.requests.AuthorizedSession(creds)
+        resp = self._session.get(url)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _list_locations(self, endpoint: str) -> list:
+        """
+        Return the location IDs to iterate for a given service endpoint.
+
+        Priority:
+          1. If --regions was supplied, return those regions immediately
+             (no API call needed — saves quota and time).
+          2. Otherwise, call the service's locations API.
+          3. Fall back to COMMON_REGIONS if the API call fails.
+        """
+        if self.regions is not None:
+            return sorted(self.regions)   # user-specified; no API call at all
+        try:
+            data = self._authed_get(
+                f"https://{endpoint}/v1/projects/{self.project_id}/locations"
+            )
+            return [loc["locationId"] for loc in data.get("locations", [])]
+        except Exception as exc:
+            logger.debug(
+                "Could not list locations for %s (%s) — using common regions.",
+                endpoint, exc,
+            )
+            return COMMON_REGIONS
+
+    def _matched_target(self, key: str) -> Optional[str]:
+        """
+        Return the canonical target key that *key* matches, or None.
+
+        Matching layers (applied in order):
+          1. Exact        — case-insensitive string equality
+          2. Normalized   — strip hyphens, underscores, spaces then compare
+          3. Fuzzy        — difflib ratio >= self.fuzzy_threshold (if > 0)
+
+        Only called when self.label_keys is not None.
+        """
+        key_lower = key.lower()
+
+        # Layer 1: exact (case-insensitive)
+        if key_lower in self.label_keys:
+            return key_lower
+
+        key_norm = re.sub(r"[-_\s]", "", key_lower)
+
+        best_target: Optional[str] = None
+        best_score: float = 0.0
+
+        for target in self.label_keys:
+            # Layer 2: normalized equality
+            if key_norm == re.sub(r"[-_\s]", "", target):
+                return target
+
+            # Layer 3: fuzzy — track best score across all targets
+            if self.fuzzy_threshold > 0.0:
+                score = difflib.SequenceMatcher(None, key_lower, target).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_target = target
+
+        if self.fuzzy_threshold > 0.0 and best_score >= self.fuzzy_threshold:
+            return best_target
+
+        return None
+
+    # -----------------------------------------------------------------------
+    # Reliability helpers
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _paginate_rest(list_callable: Callable, items_key: str, **kwargs) -> list:
+        """
+        Iterate ALL pages of a googleapiclient.discovery list call.
+
+        list_callable — bound list method, e.g. sqladmin.instances().list
+        items_key     — the key that holds the list in the response dict
+
+        googleapiclient only returns one page per execute(); callers that
+        omit this loop silently drop every resource beyond the first page.
+        """
+        items: list = []
+        page_token: Optional[str] = None
+        while True:
+            if page_token:
+                kwargs["pageToken"] = page_token
+            response = list_callable(**kwargs).execute()
+            items.extend(response.get(items_key) or [])
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+        return items
+
+    def _fingerprint_retry(self, fn: Callable, max_retries: int = 3):
+        """
+        Run fn(), retrying on fingerprint conflict errors.
+
+        Two different HTTP status codes are used across GCP services:
+          - Compute Engine set_labels → 412 Precondition Failed
+            → google.api_core.exceptions.FailedPrecondition
+          - GKE SetLabels            → 409 Conflict / Aborted
+            → google.api_core.exceptions.Aborted
+
+        Both are retried here.  fn() must re-fetch the resource (and its
+        fresh fingerprint) on each attempt — never cache the fingerprint
+        outside fn().
+        """
+        from google.api_core import exceptions as api_exc
+        _conflict = (api_exc.FailedPrecondition, api_exc.Aborted)
+        for attempt in range(max_retries):
+            try:
+                return fn()
+            except _conflict as exc:
+                if attempt == max_retries - 1:
+                    raise
+                wait = 2 ** attempt   # 1s, 2s, 4s …
+                logger.warning(
+                    "Fingerprint conflict (%s) — retry %d/%d in %ds",
+                    type(exc).__name__, attempt + 1, max_retries, wait,
+                )
+                time.sleep(wait)
+
+    def _backoff_retry(self, fn: Callable, label: str = "", max_retries: int = 5):
+        """
+        Run fn(), retrying on quota (429 ResourceExhausted) and transient
+        (503 ServiceUnavailable) errors with exponential backoff.
+
+        ResourceExhausted errors were previously in _skip_exc() which caused
+        them to be silently dropped. They are now retried instead.
+        """
+        from google.api_core import exceptions as api_exc
+        for attempt in range(max_retries):
+            try:
+                return fn()
+            except (api_exc.ResourceExhausted, api_exc.ServiceUnavailable) as exc:
+                if attempt == max_retries - 1:
+                    raise
+                wait = min(60, 2 ** attempt)
+                logger.warning(
+                    "Transient error%s (attempt %d/%d) — retrying in %ds: %s",
+                    f" [{label}]" if label else "", attempt + 1, max_retries, wait, exc,
+                )
+                time.sleep(wait)
+
+    def _new_labels(self, current: dict) -> dict:
+        """
+        Return the labels that should remain on a resource after removal.
+
+        If label_keys is set → drop keys that match any target (exact /
+        normalised / fuzzy).  Everything else is preserved.
+        If label_keys is None → drop all (original behaviour).
+        """
+        if self.label_keys is None:
+            return {}
+        return {k: v for k, v in current.items()
+                if self._matched_target(k) is None}
+
+    @staticmethod
+    def _skip_exc():
+        """
+        Exceptions that indicate a service/resource is simply not in use for
+        this project and should be silently skipped.
+
+        ResourceExhausted (quota) is NOT listed here — it is retried with
+        backoff via _backoff_retry() instead of being silently ignored.
+        """
+        from google.api_core import exceptions as api_exc
+        return (
+            api_exc.NotFound,
+            api_exc.PermissionDenied,
+            api_exc.InvalidArgument,
+        )
+
+    # -----------------------------------------------------------------------
+    # Compute Engine
+    # -----------------------------------------------------------------------
+
+    def _fetch_compute(self):
+        from google.cloud import compute_v1
+
+        for zone, scoped in compute_v1.InstancesClient().aggregated_list(project=self.project_id):
+            for r in getattr(scoped, "instances", []):
+                if r.labels:
+                    self._record("compute", "instance", r.name, r.self_link,
+                                 zone.split("/")[-1], r.labels)
+
+        for zone, scoped in compute_v1.DisksClient().aggregated_list(project=self.project_id):
+            for r in getattr(scoped, "disks", []):
+                if r.labels:
+                    self._record("compute", "disk", r.name, r.self_link,
+                                 zone.split("/")[-1], r.labels)
+
+        for r in compute_v1.SnapshotsClient().list(project=self.project_id):
+            if r.labels:
+                self._record("compute", "snapshot", r.name, r.self_link, "global", r.labels)
+
+        for r in compute_v1.ImagesClient().list(project=self.project_id):
+            if r.labels:
+                self._record("compute", "image", r.name, r.self_link, "global", r.labels)
+
+    def _remove_compute_instance_labels(self, rec: ResourceRecord):
+        from google.cloud import compute_v1
+        c = compute_v1.InstancesClient()
+        def _do():
+            inst = c.get(project=self.project_id, zone=rec.location, instance=rec.name)
+            c.set_labels(
+                project=self.project_id, zone=rec.location, instance=rec.name,
+                instances_set_labels_request_resource=compute_v1.InstancesSetLabelsRequest(
+                    label_fingerprint=inst.label_fingerprint,
+                    labels=self._new_labels(dict(inst.labels)),
+                ),
+            ).result()
+        self._fingerprint_retry(_do)
+
+    def _remove_compute_disk_labels(self, rec: ResourceRecord):
+        from google.cloud import compute_v1
+        c = compute_v1.DisksClient()
+        def _do():
+            disk = c.get(project=self.project_id, zone=rec.location, disk=rec.name)
+            c.set_labels(
+                project=self.project_id, zone=rec.location, disk=rec.name,
+                zone_set_labels_request_resource=compute_v1.ZoneSetLabelsRequest(
+                    label_fingerprint=disk.label_fingerprint,
+                    labels=self._new_labels(dict(disk.labels)),
+                ),
+            ).result()
+        self._fingerprint_retry(_do)
+
+    def _remove_compute_snapshot_labels(self, rec: ResourceRecord):
+        from google.cloud import compute_v1
+        c = compute_v1.SnapshotsClient()
+        def _do():
+            snap = c.get(project=self.project_id, snapshot=rec.name)
+            c.set_labels(
+                project=self.project_id, resource=rec.name,
+                global_set_labels_request_resource=compute_v1.GlobalSetLabelsRequest(
+                    label_fingerprint=snap.label_fingerprint,
+                    labels=self._new_labels(dict(snap.labels)),
+                ),
+            ).result()
+        self._fingerprint_retry(_do)
+
+    def _remove_compute_image_labels(self, rec: ResourceRecord):
+        from google.cloud import compute_v1
+        c = compute_v1.ImagesClient()
+        def _do():
+            img = c.get(project=self.project_id, image=rec.name)
+            c.set_labels(
+                project=self.project_id, resource=rec.name,
+                global_set_labels_request_resource=compute_v1.GlobalSetLabelsRequest(
+                    label_fingerprint=img.label_fingerprint,
+                    labels=self._new_labels(dict(img.labels)),
+                ),
+            ).result()
+        self._fingerprint_retry(_do)
+
+    # -----------------------------------------------------------------------
+    # Networking (via Compute API)
+    # -----------------------------------------------------------------------
+
+    def _fetch_networking(self):
+        from google.cloud import compute_v1
+
+        for region, scoped in compute_v1.ForwardingRulesClient().aggregated_list(
+                project=self.project_id):
+            for r in getattr(scoped, "forwarding_rules", []):
+                if r.labels:
+                    self._record("networking", "forwardingrule", r.name, r.self_link,
+                                 region.split("/")[-1], r.labels)
+
+        for r in compute_v1.GlobalForwardingRulesClient().list(project=self.project_id):
+            if r.labels:
+                self._record("networking", "globalforwardingrule", r.name, r.self_link,
+                             "global", r.labels)
+
+        for region, scoped in compute_v1.VpnGatewaysClient().aggregated_list(
+                project=self.project_id):
+            for r in getattr(scoped, "vpn_gateways", []):
+                if r.labels:
+                    self._record("networking", "vpngateway", r.name, r.self_link,
+                                 region.split("/")[-1], r.labels)
+
+        for r in compute_v1.ExternalVpnGatewaysClient().list(project=self.project_id):
+            if r.labels:
+                self._record("networking", "externalvpngateway", r.name, r.self_link,
+                             "global", r.labels)
+
+    def _remove_forwarding_rule_labels(self, rec: ResourceRecord):
+        from google.cloud import compute_v1
+        c = compute_v1.ForwardingRulesClient()
+        def _do():
+            fr = c.get(project=self.project_id, region=rec.location, forwarding_rule=rec.name)
+            c.set_labels(
+                project=self.project_id, region=rec.location, resource=rec.name,
+                region_set_labels_request_resource=compute_v1.RegionSetLabelsRequest(
+                    label_fingerprint=fr.label_fingerprint,
+                    labels=self._new_labels(dict(fr.labels)),
+                ),
+            ).result()
+        self._fingerprint_retry(_do)
+
+    def _remove_global_forwarding_rule_labels(self, rec: ResourceRecord):
+        from google.cloud import compute_v1
+        c = compute_v1.GlobalForwardingRulesClient()
+        def _do():
+            fr = c.get(project=self.project_id, forwarding_rule=rec.name)
+            c.set_labels(
+                project=self.project_id, resource=rec.name,
+                global_set_labels_request_resource=compute_v1.GlobalSetLabelsRequest(
+                    label_fingerprint=fr.label_fingerprint,
+                    labels=self._new_labels(dict(fr.labels)),
+                ),
+            ).result()
+        self._fingerprint_retry(_do)
+
+    def _remove_vpn_gateway_labels(self, rec: ResourceRecord):
+        from google.cloud import compute_v1
+        c = compute_v1.VpnGatewaysClient()
+        def _do():
+            gw = c.get(project=self.project_id, region=rec.location, vpn_gateway=rec.name)
+            c.set_labels(
+                project=self.project_id, region=rec.location, resource=rec.name,
+                region_set_labels_request_resource=compute_v1.RegionSetLabelsRequest(
+                    label_fingerprint=gw.label_fingerprint,
+                    labels=self._new_labels(dict(gw.labels)),
+                ),
+            ).result()
+        self._fingerprint_retry(_do)
+
+    def _remove_external_vpn_gateway_labels(self, rec: ResourceRecord):
+        from google.cloud import compute_v1
+        c = compute_v1.ExternalVpnGatewaysClient()
+        def _do():
+            gw = c.get(project=self.project_id, external_vpn_gateway=rec.name)
+            c.set_labels(
+                project=self.project_id, resource=rec.name,
+                global_set_labels_request_resource=compute_v1.GlobalSetLabelsRequest(
+                    label_fingerprint=gw.label_fingerprint,
+                    labels=self._new_labels(dict(gw.labels)),
+                ),
+            ).result()
+        self._fingerprint_retry(_do)
+
+    # -----------------------------------------------------------------------
+    # Cloud Storage
+    # -----------------------------------------------------------------------
+
+    def _fetch_gcs(self):
+        from google.cloud import storage
+        client = storage.Client(project=self.project_id)
+        for bucket in client.list_buckets():
+            bucket.reload()
+            if bucket.labels:
+                self._record("gcs", "bucket", bucket.name,
+                             f"projects/{self.project_id}/buckets/{bucket.name}",
+                             bucket.location or "unknown", bucket.labels)
+
+    def _remove_gcs_labels(self, rec: ResourceRecord):
+        from google.cloud import storage
+        bucket = storage.Client(project=self.project_id).get_bucket(rec.name)
+        bucket.labels = self._new_labels(dict(bucket.labels))
+        bucket.patch()
+
+    # -----------------------------------------------------------------------
+    # BigQuery
+    # -----------------------------------------------------------------------
+
+    def _fetch_bigquery(self):
+        from google.cloud import bigquery
+        client = bigquery.Client(project=self.project_id)
+        for ds_ref in client.list_datasets():
+            dataset = client.get_dataset(ds_ref.dataset_id)
+            if dataset.labels:
+                self._record("bigquery", "dataset", dataset.dataset_id,
+                             dataset.dataset_id,
+                             dataset.location or "unknown", dataset.labels)
+            for tbl_ref in client.list_tables(dataset):
+                table = client.get_table(tbl_ref)
+                if table.labels:
+                    full = f"{dataset.dataset_id}.{table.table_id}"
+                    self._record("bigquery", "table", full, full,
+                                 dataset.location or "unknown", table.labels)
+
+    def _remove_bigquery_dataset_labels(self, rec: ResourceRecord):
+        from google.cloud import bigquery
+        client = bigquery.Client(project=self.project_id)
+        ds = client.get_dataset(rec.name)
+        ds.labels = self._new_labels(dict(ds.labels))
+        client.update_dataset(ds, ["labels"])
+
+    def _remove_bigquery_table_labels(self, rec: ResourceRecord):
+        from google.cloud import bigquery
+        client = bigquery.Client(project=self.project_id)
+        dataset_id, table_id = rec.name.split(".", 1)
+        table = client.get_table(f"{dataset_id}.{table_id}")
+        table.labels = self._new_labels(dict(table.labels))
+        client.update_table(table, ["labels"])
+
+    # -----------------------------------------------------------------------
+    # GKE
+    # -----------------------------------------------------------------------
+
+    def _fetch_gke(self):
+        from google.cloud import container_v1
+        resp = container_v1.ClusterManagerClient().list_clusters(
+            parent=f"projects/{self.project_id}/locations/-"
+        )
+        for cluster in resp.clusters:
+            if cluster.resource_labels:
+                self._record("gke", "cluster", cluster.name,
+                             cluster.self_link or cluster.name,
+                             cluster.location, cluster.resource_labels)
+
+    def _remove_gke_cluster_labels(self, rec: ResourceRecord):
+        from google.cloud import container_v1
+        client = container_v1.ClusterManagerClient()
+        name = f"projects/{self.project_id}/locations/{rec.location}/clusters/{rec.name}"
+        def _do():
+            cluster = client.get_cluster(name=name)
+            # set_labels returns a long-running Operation — must await it.
+            op = client.set_labels(request=container_v1.SetLabelsRequest(
+                name=name,
+                resource_labels=self._new_labels(dict(cluster.resource_labels)),
+                label_fingerprint=cluster.label_fingerprint,
+            ))
+            op.result()
+        self._fingerprint_retry(_do)
+
+    # -----------------------------------------------------------------------
+    # Pub/Sub
+    # -----------------------------------------------------------------------
+
+    def _fetch_pubsub(self):
+        from google.pubsub_v1.services.publisher import PublisherClient
+        from google.pubsub_v1.services.subscriber import SubscriberClient
+
+        project_path = f"projects/{self.project_id}"
+        for topic in PublisherClient().list_topics(request={"project": project_path}):
+            if topic.labels:
+                self._record("pubsub", "topic", topic.name.split("/")[-1], topic.name,
+                             "global", topic.labels)
+        for sub in SubscriberClient().list_subscriptions(request={"project": project_path}):
+            if sub.labels:
+                self._record("pubsub", "subscription", sub.name.split("/")[-1], sub.name,
+                             "global", sub.labels)
+
+    def _remove_pubsub_topic_labels(self, rec: ResourceRecord):
+        from google.pubsub_v1.services.publisher import PublisherClient
+        from google.pubsub_v1.types import Topic
+        from google.protobuf import field_mask_pb2
+        publisher = PublisherClient()
+        current = publisher.get_topic(request={"topic": rec.resource_id})
+        publisher.update_topic(request={
+            "topic": Topic(name=rec.resource_id,
+                           labels=self._new_labels(dict(current.labels))),
+            "update_mask": field_mask_pb2.FieldMask(paths=["labels"]),
+        })
+
+    def _remove_pubsub_subscription_labels(self, rec: ResourceRecord):
+        from google.pubsub_v1.services.subscriber import SubscriberClient
+        from google.pubsub_v1.types import Subscription
+        from google.protobuf import field_mask_pb2
+        subscriber = SubscriberClient()
+        current = subscriber.get_subscription(
+            request={"subscription": rec.resource_id}
+        )
+        subscriber.update_subscription(request={
+            "subscription": Subscription(
+                name=rec.resource_id,
+                labels=self._new_labels(dict(current.labels)),
+            ),
+            "update_mask": field_mask_pb2.FieldMask(paths=["labels"]),
+        })
+
+    # -----------------------------------------------------------------------
+    # Cloud Run
+    # -----------------------------------------------------------------------
+
+    def _fetch_cloud_run(self):
+        from google.cloud import run_v2
+        for svc in run_v2.ServicesClient().list_services(
+                request={"parent": f"projects/{self.project_id}/locations/-"}):
+            labels = dict(svc.labels) if svc.labels else {}
+            if labels:
+                self._record("run", "service", svc.name.split("/")[-1], svc.name,
+                             svc.name.split("/")[3], labels)
+
+    def _remove_cloud_run_labels(self, rec: ResourceRecord):
+        from google.cloud import run_v2
+        from google.protobuf import field_mask_pb2
+        client = run_v2.ServicesClient()
+        current = client.get_service(name=rec.resource_id)
+        new_labels = self._new_labels(dict(current.labels))
+        # Build a minimal Service object rather than mutating the fetched proto
+        # in-place — avoids fragile proto-plus MapField mutation behaviour.
+        updated = run_v2.Service(name=rec.resource_id, labels=new_labels)
+        client.update_service(request=run_v2.UpdateServiceRequest(
+            service=updated,
+            update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+        )).result()
+
+    # -----------------------------------------------------------------------
+    # Cloud Functions (gen2)
+    # -----------------------------------------------------------------------
+
+    def _fetch_functions(self):
+        from google.cloud import functions_v2
+        for fn in functions_v2.FunctionServiceClient().list_functions(
+                request={"parent": f"projects/{self.project_id}/locations/-"}):
+            if fn.labels:
+                self._record("functions", "function", fn.name.split("/")[-1], fn.name,
+                             fn.name.split("/")[3], fn.labels)
+
+    def _remove_function_labels(self, rec: ResourceRecord):
+        from google.cloud import functions_v2
+        from google.protobuf import field_mask_pb2
+        client = functions_v2.FunctionServiceClient()
+        current = client.get_function(name=rec.resource_id)
+        new_labels = self._new_labels(dict(current.labels))
+        # Construct a minimal Function object — avoids proto-plus in-place
+        # MapField mutation which is fragile across library versions.
+        updated = functions_v2.Function(name=rec.resource_id, labels=new_labels)
+        client.update_function(request=functions_v2.UpdateFunctionRequest(
+            function=updated,
+            update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+        )).result()
+
+    # -----------------------------------------------------------------------
+    # Cloud SQL
+    # -----------------------------------------------------------------------
+
+    def _fetch_cloud_sql(self):
+        import googleapiclient.discovery
+        sqladmin = googleapiclient.discovery.build("sqladmin", "v1")
+        # list() is paginated — a single execute() only returns the first page.
+        for inst in self._paginate_rest(
+            sqladmin.instances().list, "items", project=self.project_id
+        ):
+            labels = inst.get("userLabels", {})
+            if labels:
+                self._record("sql", "instance", inst["name"],
+                             f"projects/{self.project_id}/instances/{inst['name']}",
+                             inst.get("region", "unknown"), labels)
+
+    def _remove_sql_instance_labels(self, rec: ResourceRecord):
+        import googleapiclient.discovery
+        sqladmin = googleapiclient.discovery.build("sqladmin", "v1")
+        # GET current labels live
+        current = sqladmin.instances().get(
+            project=self.project_id, instance=rec.name
+        ).execute()
+        current_labels = current.get("userLabels", {})
+        # Set targeted keys to None (SQL API deletes them), keep the rest
+        patch_labels = {k: None for k in rec.labels_removed if k in current_labels}
+        patch_labels.update(self._new_labels(current_labels))
+        sqladmin.instances().patch(
+            project=self.project_id, instance=rec.name,
+            body={"userLabels": patch_labels},
+        ).execute()
+
+    # -----------------------------------------------------------------------
+    # Cloud KMS
+    # -----------------------------------------------------------------------
+
+    def _fetch_kms(self):
+        from google.cloud import kms_v1
+
+        client = kms_v1.KeyManagementServiceClient()
+        locations = self._list_locations("cloudkms.googleapis.com")
+        for loc in locations:
+            if loc == "global":
+                continue
+            parent = f"projects/{self.project_id}/locations/{loc}"
+            try:
+                for key_ring in client.list_key_rings(parent=parent):
+                    for key in client.list_crypto_keys(parent=key_ring.name):
+                        if key.labels:
+                            self._record("kms", "cryptokey",
+                                         key.name.split("/")[-1], key.name,
+                                         loc, key.labels)
+            except self._skip_exc():
+                pass
+            except Exception as exc:
+                logger.debug("KMS skip %s: %s", loc, exc)
+
+    def _remove_kms_cryptokey_labels(self, rec: ResourceRecord):
+        from google.cloud import kms_v1
+        from google.protobuf import field_mask_pb2
+        client = kms_v1.KeyManagementServiceClient()
+        current = client.get_crypto_key(name=rec.resource_id)
+        client.update_crypto_key(
+            request=kms_v1.UpdateCryptoKeyRequest(
+                crypto_key=kms_v1.CryptoKey(
+                    name=rec.resource_id,
+                    labels=self._new_labels(dict(current.labels)),
+                ),
+                update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+            )
+        )
+
+    # -----------------------------------------------------------------------
+    # Secret Manager
+    # -----------------------------------------------------------------------
+
+    def _fetch_secretmanager(self):
+        from google.cloud import secretmanager_v1
+        for secret in secretmanager_v1.SecretManagerServiceClient().list_secrets(
+                request={"parent": f"projects/{self.project_id}"}):
+            if secret.labels:
+                self._record("secretmanager", "secret",
+                             secret.name.split("/")[-1], secret.name,
+                             "global", secret.labels)
+
+    def _remove_secret_labels(self, rec: ResourceRecord):
+        from google.cloud import secretmanager_v1
+        from google.protobuf import field_mask_pb2
+        client = secretmanager_v1.SecretManagerServiceClient()
+        current = client.get_secret(request={"name": rec.resource_id})
+        client.update_secret(
+            request=secretmanager_v1.UpdateSecretRequest(
+                secret=secretmanager_v1.Secret(
+                    name=rec.resource_id,
+                    labels=self._new_labels(dict(current.labels)),
+                ),
+                update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+            )
+        )
+
+    # -----------------------------------------------------------------------
+    # Cloud Monitoring — Alert Policies
+    # -----------------------------------------------------------------------
+
+    def _fetch_monitoring(self):
+        from google.cloud import monitoring_v3
+        for policy in monitoring_v3.AlertPolicyServiceClient().list_alert_policies(
+                name=f"projects/{self.project_id}"):
+            if policy.user_labels:
+                self._record("monitoring", "alertpolicy",
+                             policy.name.split("/")[-1], policy.name,
+                             "global", dict(policy.user_labels))
+
+    def _remove_alert_policy_labels(self, rec: ResourceRecord):
+        from google.cloud import monitoring_v3
+        from google.protobuf import field_mask_pb2
+        client = monitoring_v3.AlertPolicyServiceClient()
+        current = client.get_alert_policy(name=rec.resource_id)
+        client.update_alert_policy(
+            request=monitoring_v3.UpdateAlertPolicyRequest(
+                alert_policy=monitoring_v3.AlertPolicy(
+                    name=rec.resource_id,
+                    user_labels=self._new_labels(dict(current.user_labels)),
+                ),
+                update_mask=field_mask_pb2.FieldMask(paths=["user_labels"]),
+            )
+        )
+
+    # -----------------------------------------------------------------------
+    # Cloud DNS
+    # -----------------------------------------------------------------------
+
+    def _fetch_dns(self):
+        import googleapiclient.discovery
+        dns = googleapiclient.discovery.build("dns", "v1")
+        # managedZones.list is paginated — must follow nextPageToken.
+        for zone in self._paginate_rest(
+            dns.managedZones().list, "managedZones", project=self.project_id
+        ):
+            labels = zone.get("labels", {})
+            if labels:
+                self._record("dns", "zone", zone["name"],
+                             f"projects/{self.project_id}/managedZones/{zone['name']}",
+                             zone.get("visibility", "public"), labels)
+
+    def _remove_dns_zone_labels(self, rec: ResourceRecord):
+        import googleapiclient.discovery
+        dns = googleapiclient.discovery.build("dns", "v1")
+        zone = dns.managedZones().get(
+            project=self.project_id, managedZone=rec.name
+        ).execute()
+        dns.managedZones().patch(
+            project=self.project_id, managedZone=rec.name,
+            body={
+                "labels": self._new_labels(zone.get("labels", {})),
+                "labelFingerprint": zone.get("labelFingerprint", ""),
+            },
+        ).execute()
+
+    # -----------------------------------------------------------------------
+    # Artifact Registry
+    # -----------------------------------------------------------------------
+
+    def _fetch_artifactregistry(self):
+        from google.cloud import artifactregistry_v1
+        for repo in artifactregistry_v1.ArtifactRegistryClient().list_repositories(
+                parent=f"projects/{self.project_id}/locations/-"):
+            if repo.labels:
+                self._record("artifactregistry", "repository",
+                             repo.name.split("/")[-1], repo.name,
+                             repo.name.split("/")[3], repo.labels)
+
+    def _remove_artifact_repo_labels(self, rec: ResourceRecord):
+        from google.cloud import artifactregistry_v1
+        from google.protobuf import field_mask_pb2
+        client = artifactregistry_v1.ArtifactRegistryClient()
+        current = client.get_repository(name=rec.resource_id)
+        client.update_repository(
+            request=artifactregistry_v1.UpdateRepositoryRequest(
+                repository=artifactregistry_v1.Repository(
+                    name=rec.resource_id,
+                    labels=self._new_labels(dict(current.labels)),
+                ),
+                update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+            )
+        )
+
+    # -----------------------------------------------------------------------
+    # Vertex AI — Datasets, Models, Endpoints
+    # -----------------------------------------------------------------------
+
+    def _fetch_vertexai(self):
+        from google.cloud import aiplatform_v1
+
+        # Prefer dynamic discovery; fall back to the curated list if the
+        # locations endpoint is unreachable (e.g. API not enabled).
+        locations = self._list_locations("aiplatform.googleapis.com")
+        if locations == COMMON_REGIONS:
+            locations = VERTEX_AI_REGIONS
+        locations = [loc for loc in locations if loc != "global"]
+
+        for loc in locations:
+            opts = {"api_endpoint": f"{loc}-aiplatform.googleapis.com"}
+            parent = f"projects/{self.project_id}/locations/{loc}"
+
+            for ClientCls, rtype in [
+                (aiplatform_v1.DatasetServiceClient,  "dataset"),
+                (aiplatform_v1.ModelServiceClient,    "model"),
+                (aiplatform_v1.EndpointServiceClient, "endpoint"),
+            ]:
+                try:
+                    client = ClientCls(client_options=opts)
+                    list_fn = {
+                        "dataset":  client.list_datasets,
+                        "model":    client.list_models,
+                        "endpoint": client.list_endpoints,
+                    }[rtype]
+                    for resource in list_fn(parent=parent):
+                        if resource.labels:
+                            self._record("vertexai", rtype,
+                                         resource.name.split("/")[-1], resource.name,
+                                         loc, resource.labels)
+                except self._skip_exc():
+                    pass
+                except Exception as exc:
+                    logger.debug("Vertex AI %s skip %s: %s", rtype, loc, exc)
+
+    def _remove_vertexai_dataset_labels(self, rec: ResourceRecord):
+        from google.cloud import aiplatform_v1
+        from google.protobuf import field_mask_pb2
+        opts = {"api_endpoint": f"{rec.location}-aiplatform.googleapis.com"}
+        client = aiplatform_v1.DatasetServiceClient(client_options=opts)
+        current = client.get_dataset(name=rec.resource_id)
+        client.update_dataset(request=aiplatform_v1.UpdateDatasetRequest(
+            dataset=aiplatform_v1.Dataset(
+                name=rec.resource_id,
+                labels=self._new_labels(dict(current.labels)),
+            ),
+            update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+        ))
+
+    def _remove_vertexai_model_labels(self, rec: ResourceRecord):
+        from google.cloud import aiplatform_v1
+        from google.protobuf import field_mask_pb2
+        opts = {"api_endpoint": f"{rec.location}-aiplatform.googleapis.com"}
+        client = aiplatform_v1.ModelServiceClient(client_options=opts)
+        current = client.get_model(name=rec.resource_id)
+        client.update_model(request=aiplatform_v1.UpdateModelRequest(
+            model=aiplatform_v1.Model(
+                name=rec.resource_id,
+                labels=self._new_labels(dict(current.labels)),
+            ),
+            update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+        ))
+
+    def _remove_vertexai_endpoint_labels(self, rec: ResourceRecord):
+        from google.cloud import aiplatform_v1
+        from google.protobuf import field_mask_pb2
+        opts = {"api_endpoint": f"{rec.location}-aiplatform.googleapis.com"}
+        client = aiplatform_v1.EndpointServiceClient(client_options=opts)
+        current = client.get_endpoint(name=rec.resource_id)
+        client.update_endpoint(request=aiplatform_v1.UpdateEndpointRequest(
+            endpoint=aiplatform_v1.Endpoint(
+                name=rec.resource_id,
+                labels=self._new_labels(dict(current.labels)),
+            ),
+            update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+        ))
+
+    # -----------------------------------------------------------------------
+    # Vertex AI Search (Discovery Engine)
+    # -----------------------------------------------------------------------
+
+    def _fetch_vertexaisearch(self):
+        from google.cloud import discoveryengine_v1
+        # Discovery Engine does NOT support a collections/- wildcard.
+        # The standard collection is "default_collection"; iterate each location
+        # (including "global" which hosts the majority of data stores).
+        client = discoveryengine_v1.DataStoreServiceClient()
+        locations = list(self._list_locations("discoveryengine.googleapis.com"))
+        if "global" not in locations:
+            locations.append("global")
+
+        for loc in locations:
+            parent = (
+                f"projects/{self.project_id}/locations/{loc}"
+                f"/collections/default_collection"
+            )
+            try:
+                for ds in client.list_data_stores(parent=parent):
+                    if ds.labels:
+                        self._record("vertexaisearch", "datastore",
+                                     ds.name.split("/")[-1], ds.name, loc, ds.labels)
+            except self._skip_exc():
+                pass
+            except Exception as exc:
+                logger.debug("Vertex AI Search skip %s: %s", loc, exc)
+
+    def _remove_vertexaisearch_datastore_labels(self, rec: ResourceRecord):
+        from google.cloud import discoveryengine_v1
+        from google.protobuf import field_mask_pb2
+        client = discoveryengine_v1.DataStoreServiceClient()
+        current = client.get_data_store(name=rec.resource_id)
+        client.update_data_store(
+            request=discoveryengine_v1.UpdateDataStoreRequest(
+                data_store=discoveryengine_v1.DataStore(
+                    name=rec.resource_id,
+                    labels=self._new_labels(dict(current.labels)),
+                ),
+                update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+            )
+        )
+
+    # -----------------------------------------------------------------------
+    # Dataplex — Lakes, Zones, Assets
+    # -----------------------------------------------------------------------
+
+    def _fetch_dataplex(self):
+        from google.cloud import dataplex_v1
+        client = dataplex_v1.DataplexServiceClient()
+        try:
+            for lake in client.list_lakes(
+                    parent=f"projects/{self.project_id}/locations/-"):
+                loc = lake.name.split("/")[3]
+                if lake.labels:
+                    self._record("dataplex", "lake",
+                                 lake.name.split("/")[-1], lake.name, loc, lake.labels)
+                for zone in client.list_zones(parent=lake.name):
+                    if zone.labels:
+                        self._record("dataplex", "zone",
+                                     zone.name.split("/")[-1], zone.name, loc, zone.labels)
+                    for asset in client.list_assets(parent=zone.name):
+                        if asset.labels:
+                            self._record("dataplex", "asset",
+                                         asset.name.split("/")[-1], asset.name,
+                                         loc, asset.labels)
+        except self._skip_exc():
+            pass
+
+    def _remove_dataplex_lake_labels(self, rec: ResourceRecord):
+        from google.cloud import dataplex_v1
+        from google.protobuf import field_mask_pb2
+        client = dataplex_v1.DataplexServiceClient()
+        current = client.get_lake(name=rec.resource_id)
+        client.update_lake(
+            request=dataplex_v1.UpdateLakeRequest(
+                lake=dataplex_v1.Lake(
+                    name=rec.resource_id,
+                    labels=self._new_labels(dict(current.labels)),
+                ),
+                update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+            )
+        ).result()
+
+    def _remove_dataplex_zone_labels(self, rec: ResourceRecord):
+        from google.cloud import dataplex_v1
+        from google.protobuf import field_mask_pb2
+        client = dataplex_v1.DataplexServiceClient()
+        current = client.get_zone(name=rec.resource_id)
+        client.update_zone(
+            request=dataplex_v1.UpdateZoneRequest(
+                zone=dataplex_v1.Zone(
+                    name=rec.resource_id,
+                    labels=self._new_labels(dict(current.labels)),
+                ),
+                update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+            )
+        ).result()
+
+    def _remove_dataplex_asset_labels(self, rec: ResourceRecord):
+        from google.cloud import dataplex_v1
+        from google.protobuf import field_mask_pb2
+        client = dataplex_v1.DataplexServiceClient()
+        current = client.get_asset(name=rec.resource_id)
+        client.update_asset(
+            request=dataplex_v1.UpdateAssetRequest(
+                asset=dataplex_v1.Asset(
+                    name=rec.resource_id,
+                    labels=self._new_labels(dict(current.labels)),
+                ),
+                update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+            )
+        ).result()
+
+    # -----------------------------------------------------------------------
+    # Notebooks (Vertex AI Workbench)
+    # -----------------------------------------------------------------------
+
+    def _fetch_notebooks(self):
+        from google.cloud import notebooks_v2
+        try:
+            for inst in notebooks_v2.NotebookServiceClient().list_instances(
+                    parent=f"projects/{self.project_id}/locations/-"):
+                if inst.labels:
+                    self._record("notebooks", "instance",
+                                 inst.name.split("/")[-1], inst.name,
+                                 inst.name.split("/")[3], inst.labels)
+        except self._skip_exc():
+            pass
+
+    def _remove_notebook_instance_labels(self, rec: ResourceRecord):
+        from google.cloud import notebooks_v2
+        from google.protobuf import field_mask_pb2
+        client = notebooks_v2.NotebookServiceClient()
+        current = client.get_instance(name=rec.resource_id)
+        client.update_instance(
+            request=notebooks_v2.UpdateInstanceRequest(
+                instance=notebooks_v2.Instance(
+                    name=rec.resource_id,
+                    labels=self._new_labels(dict(current.labels)),
+                ),
+                update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+            )
+        ).result()
+
+    # -----------------------------------------------------------------------
+    # Cloud Workstations — Clusters, Configs, Workstations
+    # -----------------------------------------------------------------------
+
+    def _fetch_workstations(self):
+        from google.cloud import workstations_v1
+        client = workstations_v1.WorkstationsClient()
+        try:
+            for cluster in client.list_workstation_clusters(
+                    parent=f"projects/{self.project_id}/locations/-"):
+                loc = cluster.name.split("/")[3]
+                if cluster.labels:
+                    self._record("workstations", "cluster",
+                                 cluster.name.split("/")[-1], cluster.name,
+                                 loc, cluster.labels)
+                for config in client.list_workstation_configs(parent=cluster.name):
+                    if config.labels:
+                        self._record("workstations", "config",
+                                     config.name.split("/")[-1], config.name,
+                                     loc, config.labels)
+                    for ws in client.list_workstations(parent=config.name):
+                        if ws.labels:
+                            self._record("workstations", "workstation",
+                                         ws.name.split("/")[-1], ws.name,
+                                         loc, ws.labels)
+        except self._skip_exc():
+            pass
+
+    def _remove_workstation_cluster_labels(self, rec: ResourceRecord):
+        from google.cloud import workstations_v1
+        from google.protobuf import field_mask_pb2
+        client = workstations_v1.WorkstationsClient()
+        current = client.get_workstation_cluster(name=rec.resource_id)
+        client.update_workstation_cluster(
+            request=workstations_v1.UpdateWorkstationClusterRequest(
+                workstation_cluster=workstations_v1.WorkstationCluster(
+                    name=rec.resource_id,
+                    labels=self._new_labels(dict(current.labels)),
+                ),
+                update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+            )
+        ).result()
+
+    def _remove_workstation_config_labels(self, rec: ResourceRecord):
+        from google.cloud import workstations_v1
+        from google.protobuf import field_mask_pb2
+        client = workstations_v1.WorkstationsClient()
+        current = client.get_workstation_config(name=rec.resource_id)
+        client.update_workstation_config(
+            request=workstations_v1.UpdateWorkstationConfigRequest(
+                workstation_config=workstations_v1.WorkstationConfig(
+                    name=rec.resource_id,
+                    labels=self._new_labels(dict(current.labels)),
+                ),
+                update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+            )
+        ).result()
+
+    def _remove_workstation_labels(self, rec: ResourceRecord):
+        from google.cloud import workstations_v1
+        from google.protobuf import field_mask_pb2
+        client = workstations_v1.WorkstationsClient()
+        current = client.get_workstation(name=rec.resource_id)
+        client.update_workstation(
+            request=workstations_v1.UpdateWorkstationRequest(
+                workstation=workstations_v1.Workstation(
+                    name=rec.resource_id,
+                    labels=self._new_labels(dict(current.labels)),
+                ),
+                update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+            )
+        ).result()
+
+    # -----------------------------------------------------------------------
+    # Cloud Healthcare — Datasets, DICOM / FHIR / HL7v2 Stores
+    # -----------------------------------------------------------------------
+
+    def _fetch_healthcare(self):
+        import googleapiclient.discovery
+        hc = googleapiclient.discovery.build("healthcare", "v1")
+        locations = self._list_locations("healthcare.googleapis.com")
+        for loc in locations:
+            if loc == "global":
+                continue
+            parent = f"projects/{self.project_id}/locations/{loc}"
+            try:
+                # datasets.list is paginated — must follow nextPageToken.
+                datasets = self._paginate_rest(
+                    hc.projects().locations().datasets().list,
+                    "datasets", parent=parent,
+                )
+            except Exception as exc:
+                logger.debug("Healthcare skip location %s: %s", loc, exc)
+                continue
+
+            for dataset in datasets:
+                ds_name = dataset["name"]
+                ds_id = ds_name.split("/")[-1]
+                if dataset.get("labels"):
+                    self._record("healthcare", "dataset", ds_id, ds_name, loc,
+                                 dataset["labels"])
+
+                store_configs = [
+                    ("dicomStores", "dicomstore",
+                     hc.projects().locations().datasets().dicomStores()),
+                    ("fhirStores",  "fhirstore",
+                     hc.projects().locations().datasets().fhirStores()),
+                    ("hl7V2Stores", "hl7v2store",
+                     hc.projects().locations().datasets().hl7V2Stores()),
+                ]
+                for list_key, rtype, resource_api in store_configs:
+                    try:
+                        # Each store list is also paginated.
+                        stores = self._paginate_rest(
+                            resource_api.list, list_key, parent=ds_name
+                        )
+                        for store in stores:
+                            if store.get("labels"):
+                                self._record("healthcare", rtype,
+                                             store["name"].split("/")[-1], store["name"],
+                                             loc, store["labels"])
+                    except Exception as exc:
+                        logger.debug("Healthcare %s skip %s: %s", rtype, ds_name, exc)
+
+    def _remove_healthcare_dataset_labels(self, rec: ResourceRecord):
+        import googleapiclient.discovery
+        hc = googleapiclient.discovery.build("healthcare", "v1")
+        current = hc.projects().locations().datasets().get(name=rec.resource_id).execute()
+        hc.projects().locations().datasets().patch(
+            name=rec.resource_id, updateMask="labels",
+            body={"labels": self._new_labels(current.get("labels", {}))},
+        ).execute()
+
+    def _remove_healthcare_dicom_store_labels(self, rec: ResourceRecord):
+        import googleapiclient.discovery
+        hc = googleapiclient.discovery.build("healthcare", "v1")
+        api = hc.projects().locations().datasets().dicomStores()
+        current = api.get(name=rec.resource_id).execute()
+        api.patch(
+            name=rec.resource_id, updateMask="labels",
+            body={"labels": self._new_labels(current.get("labels", {}))},
+        ).execute()
+
+    def _remove_healthcare_fhir_store_labels(self, rec: ResourceRecord):
+        import googleapiclient.discovery
+        hc = googleapiclient.discovery.build("healthcare", "v1")
+        api = hc.projects().locations().datasets().fhirStores()
+        current = api.get(name=rec.resource_id).execute()
+        api.patch(
+            name=rec.resource_id, updateMask="labels",
+            body={"labels": self._new_labels(current.get("labels", {}))},
+        ).execute()
+
+    def _remove_healthcare_hl7v2_store_labels(self, rec: ResourceRecord):
+        import googleapiclient.discovery
+        hc = googleapiclient.discovery.build("healthcare", "v1")
+        api = hc.projects().locations().datasets().hl7V2Stores()
+        current = api.get(name=rec.resource_id).execute()
+        api.patch(
+            name=rec.resource_id, updateMask="labels",
+            body={"labels": self._new_labels(current.get("labels", {}))},
+        ).execute()
+
+    # -----------------------------------------------------------------------
+    # Cloud Scheduler
+    # -----------------------------------------------------------------------
+
+    def _fetch_scheduler(self):
+        from google.cloud import scheduler_v1
+        client = scheduler_v1.CloudSchedulerClient()
+        locations = self._list_locations("cloudscheduler.googleapis.com")
+        for loc in locations:
+            if loc == "global":
+                continue
+            try:
+                for job in client.list_jobs(
+                        request={"parent": f"projects/{self.project_id}/locations/{loc}"}):
+                    if job.labels:
+                        self._record("scheduler", "job",
+                                     job.name.split("/")[-1], job.name,
+                                     loc, job.labels)
+            except self._skip_exc():
+                pass
+            except Exception as exc:
+                logger.debug("Scheduler skip %s: %s", loc, exc)
+
+    def _remove_scheduler_job_labels(self, rec: ResourceRecord):
+        from google.cloud import scheduler_v1
+        from google.protobuf import field_mask_pb2
+        client = scheduler_v1.CloudSchedulerClient()
+        current = client.get_job(name=rec.resource_id)
+        client.update_job(
+            request=scheduler_v1.UpdateJobRequest(
+                job=scheduler_v1.Job(
+                    name=rec.resource_id,
+                    labels=self._new_labels(dict(current.labels)),
+                ),
+                update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+            )
+        )
+
+    # -----------------------------------------------------------------------
+    # Data Catalog — Entry Groups
+    # -----------------------------------------------------------------------
+
+    def _fetch_datacatalog(self):
+        from google.cloud import datacatalog_v1
+        # Data Catalog does NOT support the locations/- wildcard.
+        # Iterate each location explicitly.
+        client = datacatalog_v1.DataCatalogClient()
+        locations = self._list_locations("datacatalog.googleapis.com")
+        for loc in locations:
+            parent = f"projects/{self.project_id}/locations/{loc}"
+            try:
+                for eg in client.list_entry_groups(parent=parent):
+                    labels = dict(getattr(eg, "labels", {}) or {})
+                    if labels:
+                        self._record("datacatalog", "entrygroup",
+                                     eg.name.split("/")[-1], eg.name, loc, labels)
+            except self._skip_exc():
+                pass
+            except Exception as exc:
+                logger.debug("Data Catalog skip %s: %s", loc, exc)
+
+    def _remove_datacatalog_entrygroup_labels(self, rec: ResourceRecord):
+        from google.cloud import datacatalog_v1
+        from google.protobuf import field_mask_pb2
+        client = datacatalog_v1.DataCatalogClient()
+        current = client.get_entry_group(name=rec.resource_id)
+        current_labels = dict(getattr(current, "labels", {}) or {})
+        client.update_entry_group(
+            request=datacatalog_v1.UpdateEntryGroupRequest(
+                entry_group=datacatalog_v1.EntryGroup(
+                    name=rec.resource_id,
+                    labels=self._new_labels(current_labels),
+                ),
+                update_mask=field_mask_pb2.FieldMask(paths=["labels"]),
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# CSV report + summary
+# ---------------------------------------------------------------------------
+
+def write_csv(records: list, output_path: str):
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(r.to_csv_row() for r in records)
+
+    total = len(records)
+    total_labels = sum(r.label_count for r in records)
+    by_status: dict = {}
+    by_service: dict = {}
+    for r in records:
+        by_status[r.status] = by_status.get(r.status, 0) + 1
+        by_service[r.service] = by_service.get(r.service, 0) + 1
+
+    logger.info("─" * 50)
+    logger.info("Audit summary")
+    logger.info("  Total resources : %d", total)
+    logger.info("  Total labels    : %d", total_labels)
+    logger.info("  By status:")
+    for status, count in sorted(by_status.items()):
+        logger.info("    %-12s : %d", status, count)
+    logger.info("  By service:")
+    for svc, count in sorted(by_service.items()):
+        logger.info("    %-20s : %d", svc, count)
+    logger.info("  Report → %s", output_path)
+    logger.info("─" * 50)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+ALL_SERVICES = [
+    "compute", "networking", "gcs", "bigquery", "gke", "pubsub",
+    "run", "functions", "sql", "kms", "secretmanager", "monitoring",
+    "dns", "artifactregistry", "vertexai", "vertexaisearch",
+    "dataplex", "notebooks", "workstations", "healthcare",
+    "scheduler", "datacatalog",
+]
+
+
+@click.command()
+@click.option("--project", required=True, help="GCP project ID")
+@click.option(
+    "--dry-run/--execute", default=True, show_default=True,
+    help="--dry-run (default) previews; --execute removes labels.",
+)
+@click.option(
+    "--services", default=",".join(ALL_SERVICES), show_default=False,
+    help="Comma-separated services to scan. Default: all supported services.",
+)
+@click.option(
+    "--label-keys", default=None,
+    help=(
+        "Comma-separated label KEY names to target (e.g. costcentre,apmid). "
+        "Only labels whose key matches are removed; all other labels are preserved. "
+        "Omit to remove ALL labels."
+    ),
+)
+@click.option(
+    "--regions", default=None,
+    help=(
+        "Comma-separated GCP regions to scan (e.g. us-central1,us-east1). "
+        "Zones are mapped to their parent region automatically "
+        "(us-central1-a → us-central1). "
+        "Global and unknown-location resources are always included. "
+        "Omit to scan all regions."
+    ),
+)
+@click.option(
+    "--fuzzy-threshold", default=0.0, type=float, show_default=True,
+    help=(
+        "Similarity ratio (0.0–1.0) for fuzzy key matching. "
+        "0.0 disables fuzzy matching (default). "
+        "0.82 catches most single-character typos "
+        "(e.g. costcanter ≈ costcentre, costcenter ≈ costcentre). "
+        "Normalization of separators (- _ space) is always applied regardless "
+        "of this setting."
+    ),
+)
+@click.option(
+    "--output", default=None,
+    help="CSV output path. Default: gcp_label_audit_<timestamp>.csv",
+)
+def main(project: str, dry_run: bool, services: str,
+         label_keys: Optional[str], regions: Optional[str],
+         fuzzy_threshold: float, output: Optional[str]):
+    """Remove specific (or all) labels from GCP resources and produce an audit CSV."""
+    service_list = [s.strip().lower() for s in services.split(",") if s.strip()]
+    key_set = (
+        {k.strip().lower() for k in label_keys.split(",") if k.strip()}
+        if label_keys else None
+    )
+    region_set = (
+        {r.strip().lower() for r in regions.split(",") if r.strip()}
+        if regions else None
+    )
+
+    if dry_run:
+        logger.info("=== DRY-RUN MODE — no changes will be made ===")
+    else:
+        logger.warning("=== EXECUTE MODE — labels will be permanently removed ===")
+        click.confirm("Proceed with label removal?", abort=True)
+
+    if region_set:
+        logger.info("Region filter: %s", sorted(region_set))
+    else:
+        logger.info("No --regions filter — scanning all regions.")
+
+    if key_set:
+        logger.info("Targeting label keys: %s", sorted(key_set))
+        if fuzzy_threshold > 0.0:
+            logger.info("Fuzzy matching enabled — threshold: %.2f", fuzzy_threshold)
+        else:
+            logger.info("Fuzzy matching disabled (separator normalisation always on)")
+    else:
+        logger.info("No --label-keys filter — ALL labels will be removed.")
+
+    records = GCPLabelRemover(
+        project_id=project,
+        dry_run=dry_run,
+        services=service_list,
+        label_keys=key_set,
+        fuzzy_threshold=fuzzy_threshold,
+        regions=region_set,
+    ).run()
+
+    if not records:
+        logger.info("No labeled resources found. No CSV generated.")
+        sys.exit(0)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = output or f"gcp_label_audit_{ts}.csv"
+    write_csv(records, csv_path)
+
+
+if __name__ == "__main__":
+    main()
