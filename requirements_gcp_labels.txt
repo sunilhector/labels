@@ -1,0 +1,60 @@
+# Core auth / HTTP
+google-auth>=2.22.0
+google-auth-httplib2>=0.1.1
+google-api-python-client>=2.100.0
+requests>=2.31.0
+
+# Compute / Networking
+google-cloud-compute>=1.14.0
+
+# Storage
+google-cloud-storage>=2.10.0
+
+# BigQuery
+google-cloud-bigquery>=3.11.0
+
+# GKE
+google-cloud-container>=2.21.0
+
+# Pub/Sub
+google-cloud-pubsub>=2.18.0
+
+# Cloud Run / Cloud Functions
+google-cloud-run>=0.10.0
+google-cloud-functions>=1.13.0
+
+# Cloud KMS
+google-cloud-kms>=2.18.0
+
+# Secret Manager
+google-cloud-secret-manager>=2.16.0
+
+# Cloud Monitoring
+google-cloud-monitoring>=2.18.0
+
+# Artifact Registry
+google-cloud-artifact-registry>=1.8.0
+
+# Vertex AI (datasets, models, endpoints)
+google-cloud-aiplatform>=1.40.0
+
+# Vertex AI Search / Discovery Engine
+google-cloud-discoveryengine>=0.11.0
+
+# Dataplex
+google-cloud-dataplex>=1.12.0
+
+# Notebooks / Vertex AI Workbench
+google-cloud-notebooks>=1.9.0
+
+# Cloud Workstations
+google-cloud-workstations>=0.7.0
+
+# Cloud Scheduler
+google-cloud-scheduler>=2.13.0
+
+# Data Catalog
+google-cloud-datacatalog>=3.17.0
+
+# Click CLI
+click>=8.1.0
